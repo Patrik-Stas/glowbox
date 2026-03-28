@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE_FILE="${SCRIPT_DIR}/template.yaml"
+# Config: check pwd first, then fall back to script directory
+if [[ -f "${PWD}/glowbox.yaml" ]]; then
+    CONFIG_FILE="${PWD}/glowbox.yaml"
+else
+    CONFIG_FILE="${SCRIPT_DIR}/glowbox.yaml"
+fi
+DEFAULT_NAME="glowbox"
+
+# -- Dependency check ----------------------------------------------------------
+
+if ! command -v limactl &>/dev/null; then
+    echo "Error: 'limactl' is not installed. Install with: brew install lima"
+    exit 1
+fi
+
+# -- Config --------------------------------------------------------------------
+
+parse_yaml_value() {
+    local key="$1" file="$2"
+    sed -n "s/^${key}:[[:space:]]*//p" "$file" 2>/dev/null | sed 's/[[:space:]]*#.*//' | sed 's/[[:space:]]*$//'
+}
+
+resolve_path() {
+    echo "${1/#\~/$HOME}"
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+    WORK_DIR=$(parse_yaml_value "work_dir" "$CONFIG_FILE")
+    local data_raw
+    data_raw=$(parse_yaml_value "data_dir" "$CONFIG_FILE")
+    DATA_DIR="${data_raw:-~/glowbox}"
+    return 0
+}
+
+init_config() {
+    echo "No glowbox.yaml config found."
+    echo ""
+    echo "You can copy the example:  cp glowbox.yaml.example glowbox.yaml"
+    echo "Or enter your settings now:"
+    echo ""
+
+    prompt_config "$CONFIG_FILE"
+    load_config
+}
+
+prompt_config() {
+    local target="$1"
+    local work_dir data_dir
+
+    read -rp "Work mount — host directory to mount as ~/work in VMs [${PWD}]: " work_dir
+    work_dir="${work_dir:-${PWD}}"
+
+    local resolved
+    resolved=$(resolve_path "$work_dir")
+    if [[ ! -d "$resolved" ]]; then
+        echo "Note: '$resolved' does not exist yet — it will be created on first VM."
+    fi
+
+    read -rp "Data mount — base directory for per-VM storage [~/glowbox]: " data_dir
+    data_dir="${data_dir:-~/glowbox}"
+
+    cat > "$target" << EOF
+# Glowbox configuration
+
+# Work mount — shared host directory, mounted as ~/work inside VMs.
+# This is your main working directory (code, projects, etc.)
+work_dir: ${work_dir}
+
+# Data mount — per-VM isolated storage, mounted as ~/data inside VMs.
+# Each VM gets its own subdirectory: <data_dir>/<vm-name> on host → ~/data on VM.
+data_dir: ${data_dir}
+EOF
+
+    echo ""
+    echo "Config saved to $target"
+}
+
+require_config() {
+    if ! load_config; then
+        init_config
+    fi
+
+    if [[ -z "${WORK_DIR:-}" ]]; then
+        echo "Error: 'work_dir' is required in $CONFIG_FILE"
+        exit 1
+    fi
+
+    WORK_DIR_ABS=$(resolve_path "$WORK_DIR")
+    DATA_DIR_ABS=$(resolve_path "$DATA_DIR")
+}
+
+# -- Usage ---------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+Usage: glowbox <command> [name] [options]
+
+Commands:
+  init                                                     Set up glowbox.yaml config in current directory
+  create [name] [--cpus N] [--memory SIZE] [--disk SIZE]  Create and start a VM
+  shell  [name]                                            Shell into a VM (auto-starts if stopped)
+  list                                                     List all VMs
+  start  [name]                                            Start a stopped VM
+  stop   [name]                                            Stop a running VM
+  delete [name]                                            Delete a VM (with confirmation)
+  nuke   [name]                                            Force delete without confirmation
+  status [name]                                            Show detailed VM info
+  logs   [name]                                            Tail cloud-init provisioning logs
+
+Default VM name: glowbox
+
+Mounts:
+  Work  — your host working directory → ~/work in the VM (shared across VMs)
+  Data  — ~/glowbox/<vm-name> on host → ~/data in the VM (per-VM isolated)
+
+Configuration:
+  Run 'glowbox init' to create glowbox.yaml, or 'glowbox create' to be prompted.
+
+Environment:
+  Place a .env file in your work directory with exports like:
+    export ANTHROPIC_API_KEY=sk-ant-...
+  It will be auto-sourced on every shell login inside the VM.
+EOF
+    exit 1
+}
+
+# -- Helpers -------------------------------------------------------------------
+
+vm_exists() {
+    limactl list -q 2>/dev/null | grep -qx "$1"
+}
+
+vm_status() {
+    limactl list 2>/dev/null | awk -v n="$1" '$1==n{print $2}'
+}
+
+require_vm() {
+    if ! vm_exists "$1"; then
+        echo "Error: VM '$1' does not exist. Create it with: glowbox create $1"
+        exit 1
+    fi
+}
+
+# -- Commands ------------------------------------------------------------------
+
+cmd_init() {
+    local target="${PWD}/glowbox.yaml"
+
+    if [[ -f "$target" ]]; then
+        echo "glowbox.yaml already exists in this directory."
+        read -rp "Overwrite? [y/N] " confirm
+        if [[ "$confirm" != [yY] ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    echo "Setting up glowbox.yaml in $(pwd)"
+    echo ""
+    prompt_config "$target"
+}
+
+cmd_create() {
+    require_config
+
+    local name="${DEFAULT_NAME}"
+    local lima_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cpus)
+                [[ $# -lt 2 ]] && { echo "Error: --cpus requires a number."; exit 1; }
+                lima_args+=(--cpus "$2"); shift 2 ;;
+            --memory)
+                [[ $# -lt 2 ]] && { echo "Error: --memory requires a size (e.g. 8GiB)."; exit 1; }
+                lima_args+=(--memory "$2"); shift 2 ;;
+            --disk)
+                [[ $# -lt 2 ]] && { echo "Error: --disk requires a size (e.g. 60GiB)."; exit 1; }
+                lima_args+=(--disk "$2"); shift 2 ;;
+            -*)
+                echo "Error: unknown option '$1'"; exit 1 ;;
+            *)
+                name="$1"; shift ;;
+        esac
+    done
+
+    if vm_exists "$name"; then
+        echo "Error: VM '$name' already exists. Use 'glowbox shell $name' or 'glowbox delete $name' first."
+        exit 1
+    fi
+
+    if [[ ! -f "$TEMPLATE_FILE" ]]; then
+        echo "Error: template not found at $TEMPLATE_FILE"
+        exit 1
+    fi
+
+    # Create host directories
+    mkdir -p "${WORK_DIR_ABS}"
+    mkdir -p "${DATA_DIR_ABS}/${name}"
+    echo "Mounts:"
+    echo "  Work: ${WORK_DIR_ABS} -> ~/work"
+    echo "  Data: ${DATA_DIR_ABS}/${name} -> ~/data"
+
+    # Generate YAML from template
+    local tmp_yaml
+    tmp_yaml=$(mktemp /tmp/glowbox.XXXXXXXXXX.yaml)
+    sed -e "s|__WORK_DIR__|${WORK_DIR}|g" \
+        -e "s|__WORK_DIR_ABS__|${WORK_DIR_ABS}|g" \
+        -e "s|__DATA_DIR__|${DATA_DIR}|g" \
+        -e "s|__DATA_DIR_ABS__|${DATA_DIR_ABS}|g" \
+        -e "s|__VM_NAME__|${name}|g" \
+        "$TEMPLATE_FILE" > "$tmp_yaml"
+
+    echo ""
+    echo "Creating VM '$name'..."
+    limactl create --name "$name" "${lima_args[@]+"${lima_args[@]}"}" "$tmp_yaml"
+    rm -f "$tmp_yaml"
+
+    echo "Starting VM '$name' (provisioning installs Docker, zsh, Claude Code)..."
+    limactl start "$name"
+
+    # Wait for cloud-init to finish
+    echo "Waiting for provisioning to complete..."
+    if limactl shell "$name" -- cloud-init status --wait 2>/dev/null; then
+        echo ""
+        echo "VM '$name' is ready!"
+    else
+        echo ""
+        echo "VM '$name' is running (provisioning may still be finishing)."
+        echo "  Check progress: glowbox logs $name"
+    fi
+
+    # Kill SSH ControlMaster so the next shell session picks up group changes
+    ssh -O exit -o "ControlPath=$HOME/.lima/$name/ssh.sock" _ 2>/dev/null || true
+
+    echo ""
+    echo "  Shell in:   glowbox shell ${name}"
+    echo "  Work:       ~/work/"
+    echo "  Data:       ~/data/"
+}
+
+cmd_shell() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    local status
+    status="$(vm_status "$name")"
+
+    if [[ "$status" == "Stopped" ]]; then
+        echo "VM '$name' is stopped. Starting..."
+        limactl start "$name"
+    elif [[ "$status" != "Running" ]]; then
+        echo "Error: VM '$name' is in state '$status'."
+        exit 1
+    fi
+
+    exec limactl shell "$name"
+}
+
+cmd_list() {
+    limactl list
+}
+
+cmd_start() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    local status
+    status="$(vm_status "$name")"
+
+    if [[ "$status" == "Running" ]]; then
+        echo "VM '$name' is already running."
+        return
+    fi
+
+    echo "Starting VM '$name'..."
+    limactl start "$name"
+    echo "VM '$name' is running."
+}
+
+cmd_stop() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    local status
+    status="$(vm_status "$name")"
+
+    if [[ "$status" == "Stopped" ]]; then
+        echo "VM '$name' is already stopped."
+        return
+    fi
+
+    echo "Stopping VM '$name'..."
+    limactl stop "$name"
+    echo "VM '$name' stopped. Mounted files are safe on the host."
+}
+
+cmd_delete() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    echo "This will delete VM '$name' and its disk image."
+    echo "Mounted files are NOT affected — they stay on the host."
+    read -rp "Delete VM '$name'? [y/N] " confirm
+    if [[ "$confirm" != [yY] ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    local status
+    status="$(vm_status "$name")"
+    if [[ "$status" == "Running" ]]; then
+        limactl stop "$name" 2>/dev/null || true
+    fi
+
+    limactl delete "$name"
+    echo "VM '$name' deleted."
+}
+
+cmd_nuke() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    limactl stop "$name" 2>/dev/null || true
+    limactl delete --force "$name" 2>/dev/null || limactl delete "$name"
+    echo "VM '$name' nuked."
+}
+
+cmd_status() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    if command -v jq &>/dev/null; then
+        limactl list --json 2>/dev/null | jq --arg n "$name" '
+            .[] | select(.name==$n) | {
+                name, status, arch, cpus, memory, disk, dir,
+                sshLocalPort: .sshLocalPort,
+                hostAgentPID: .hostAgentPID
+            }'
+    else
+        limactl list "$name" 2>/dev/null || limactl list 2>/dev/null | head -1 && limactl list 2>/dev/null | grep "^$name "
+    fi
+}
+
+cmd_logs() {
+    local name="${1:-$DEFAULT_NAME}"
+    require_vm "$name"
+
+    local status
+    status="$(vm_status "$name")"
+
+    if [[ "$status" != "Running" ]]; then
+        echo "Error: VM '$name' is not running (status: $status). Start it first."
+        exit 1
+    fi
+
+    echo "Tailing cloud-init log (Ctrl+C to stop)..."
+    limactl shell "$name" -- sudo tail -100f /var/log/cloud-init-output.log
+}
+
+# -- Main ----------------------------------------------------------------------
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    init)        cmd_init ;;
+    create)      cmd_create "$@" ;;
+    shell|enter) cmd_shell "${1:-}" ;;
+    list|ls)     cmd_list ;;
+    start)       cmd_start "${1:-}" ;;
+    stop)        cmd_stop "${1:-}" ;;
+    delete)      cmd_delete "${1:-}" ;;
+    nuke)        cmd_nuke "${1:-}" ;;
+    status)      cmd_status "${1:-}" ;;
+    logs)        cmd_logs "${1:-}" ;;
+    *)
+        echo "Unknown command: ${command}"
+        usage
+        ;;
+esac

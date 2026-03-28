@@ -1,0 +1,204 @@
+# =============================================================================
+# Lima VM — Glowbox: Isolated Dev Environment for Claude Code Agents
+# =============================================================================
+#
+# This is a TEMPLATE — placeholders (__WORK_DIR__, __DATA_DIR__, __VM_NAME__, etc.)
+# are replaced by the `glowbox` control script at create time.
+# Do not use directly with limactl.
+#
+# =============================================================================
+
+# -- VM engine -----------------------------------------------------------------
+
+vmType: "vz"
+os: "Linux"
+arch: "aarch64"
+
+cpus: 4
+memory: "8GiB"
+disk: "60GiB"
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+
+# -- OS image ------------------------------------------------------------------
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# -- SSH -----------------------------------------------------------------------
+
+ssh:
+  forwardAgent: true
+
+# -- Mounts --------------------------------------------------------------------
+
+mountType: "virtiofs"
+
+mounts:
+  # Work mount — shared working directory (code, projects, etc.)
+  - location: "__WORK_DIR__"
+    mountPoint: "/home/{{.User}}.linux/work"
+    writable: true
+  # Data mount — per-VM isolated storage
+  - location: "__DATA_DIR__/__VM_NAME__"
+    mountPoint: "/home/{{.User}}.linux/data"
+    writable: true
+
+# -- No containerd (we install Docker CE directly) ----------------------------
+
+containerd:
+  system: false
+  user: false
+
+# -- Port forwarding (auto-forward any guest port 1024–65535 to same host port) -
+
+portForwards:
+  - guestPortRange: [1024, 65535]
+    hostIP: "127.0.0.1"
+
+# -- Provisioning --------------------------------------------------------------
+
+provision:
+  # ---- Root: system packages + Docker ----------------------------------------
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+
+      echo "==> [1/3] Installing system packages..."
+      apt-get update -q
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+        build-essential curl wget git \
+        ca-certificates gnupg apt-transport-https software-properties-common \
+        zsh tmux htop tree neovim \
+        jq ripgrep fd-find bat \
+        unzip zip python3
+
+      echo "==> [2/3] Installing Docker CE..."
+      if ! command -v docker &>/dev/null; then
+        curl -fsSL https://get.docker.com | sh
+      fi
+
+      # Docker Compose plugin
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker-compose-plugin 2>/dev/null || true
+
+      # Add all non-root human users to docker group and set zsh as default shell
+      for u in $(awk -F: '$3 >= 500 && $3 < 65534 {print $1}' /etc/passwd); do
+        usermod -aG docker "$u" 2>/dev/null || true
+        chsh -s /usr/bin/zsh "$u" 2>/dev/null || true
+        echo "==> Added $u to docker group, set zsh as default shell"
+      done
+
+      # Create macOS host path symlinks so `limactl shell` cd works silently
+      for u in $(awk -F: '$3 >= 500 && $3 < 65534 {print $1}' /etc/passwd); do
+        lima_home=$(getent passwd "$u" | cut -d: -f6)
+        host_work="__WORK_DIR_ABS__"
+        host_data="__DATA_DIR_ABS__/__VM_NAME__"
+        mkdir -p "$(dirname "$host_work")"
+        ln -sfn "$lima_home/work" "$host_work"
+        mkdir -p "$(dirname "$host_data")"
+        ln -sfn "$lima_home/data" "$host_data"
+      done
+
+      echo "==> [3/3] System provisioning complete."
+
+  # ---- User: oh-my-zsh + mise + Claude Code + aliases ------------------------
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eu
+
+      # -- oh-my-zsh --
+      echo "==> Installing oh-my-zsh..."
+      if [ ! -d "$HOME/.oh-my-zsh" ]; then
+        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+      fi
+
+      # -- mise (tool version manager) --
+      echo "==> Installing mise..."
+      if [ ! -f "$HOME/.local/bin/mise" ]; then
+        curl -fsSL https://mise.run | bash
+      fi
+
+      # -- Claude Code (native binary) --
+      echo "==> Installing Claude Code (native binary)..."
+      curl -fsSL https://claude.ai/install.sh | bash
+
+      # -- Configure shell (write to separate file to avoid YAML/heredoc conflict) --
+      echo "==> Configuring shell..."
+      {
+        echo ''
+        echo '# =========================================================================='
+        echo '# Glowbox VM configuration'
+        echo '# =========================================================================='
+        echo ''
+        echo '# Source project .env if it exists (for ANTHROPIC_API_KEY etc.)'
+        echo 'test -f "$HOME/work/.env" && set -a && source "$HOME/work/.env" && set +a'
+        echo ''
+        echo '# mise — tool version manager'
+        echo 'if [ -f "$HOME/.local/bin/mise" ]; then'
+        echo '  eval "$($HOME/.local/bin/mise activate zsh)"'
+        echo 'fi'
+        echo ''
+        echo '# Ubuntu packages bat/fd under different names'
+        echo 'command -v batcat &>/dev/null && alias bat="batcat"'
+        echo 'command -v fdfind &>/dev/null && alias fd="fdfind"'
+        echo ''
+        echo '# ---- Git ----'
+        echo 'alias g="git"'
+        echo 'alias gch="git checkout"'
+        echo 'alias gchb="git checkout -b"'
+        echo 'alias gbr="git branch"'
+        echo 'alias grb="git rebase"'
+        echo 'alias gadd="git add -u"'
+        echo 'alias gcommit="git commit"'
+        echo 'alias gamend="git commit --amend"'
+        echo 'alias gf="git fetch"'
+        echo 'alias gfprune="git fetch -p"'
+        echo 'alias gstatus="git status"'
+        echo 'alias ggba="git checkout -"'
+        echo "alias log=\"git log --pretty=format:'%C(green)%h%Creset ≁ %C(yellow)%>(12,trunc)%cr%C(white) %>(11,trunc)%an%C(green) ⟹  %C(blue) %s' --abbrev-commit --date=relative\""
+        echo "alias logg=\"git log --graph --pretty=format:'%C(green)%h%Creset ≁ %C(yellow)%>(12,trunc)%cr%C(white) %>(11,trunc)%an%C(green) ⟹  %C(blue) %s' --abbrev-commit --date=relative\""
+        echo ''
+        echo '# ---- Docker ----'
+        echo "alias kcontainers='docker rm -f \$(docker ps -qa)'"
+        echo "alias kcontainers-exited='docker rm \$(docker ps -a -q -f status=exited)'"
+        echo 'alias dps="docker ps"'
+        echo 'alias dpsa="docker ps -a"'
+        echo 'alias dimg="docker images"'
+        echo 'alias dlogs="docker logs -f"'
+        echo 'alias dexec="docker exec -it"'
+        echo 'alias dc="docker compose"'
+        echo 'alias dcu="docker compose up -d"'
+        echo 'alias dcd="docker compose down"'
+        echo 'alias dcl="docker compose logs -f"'
+        echo ''
+        echo '# ---- General ----'
+        echo 'alias ll="ls -alh"'
+        echo 'alias la="ls -A"'
+        echo 'alias vim="nvim"'
+        echo 'alias v="nvim"'
+        echo "alias ca='cat package.json | jq .scripts'"
+        echo 'alias work="cd $HOME/work"'
+        echo 'alias w="work"'
+        echo 'alias data="cd $HOME/data"'
+        echo ''
+        echo '# ---- Network ----'
+        echo 'alias checkport="ss -tlnp"'
+        echo 'alias inspectports="ss -tlnp"'
+        echo ''
+        echo '# ---- Tmux ----'
+        echo 'alias tmuxa="tmux attach"'
+      } > "$HOME/.zshrc.glowbox"
+
+      # Source glowbox config from .zshrc
+      echo '' >> "$HOME/.zshrc"
+      echo '# Glowbox configuration' >> "$HOME/.zshrc"
+      echo 'source "$HOME/.zshrc.glowbox"' >> "$HOME/.zshrc"
+
+      echo "==> User provisioning complete."

@@ -1,0 +1,16 @@
+# Glowbox configuration
+#
+# Copy this file to glowbox.yaml and fill in your values:
+#   cp glowbox.yaml.example glowbox.yaml
+#
+# Or run `glowbox init` to be prompted interactively.
+
+# Work mount — shared host directory, mounted as ~/work inside VMs.
+# This is your main working directory (code, projects, etc.)
+# Defaults to current directory when using `glowbox init`.
+work_dir: ~/my/projects
+
+# Data mount — per-VM isolated storage, mounted as ~/data inside VMs.
+# Each VM gets its own subdirectory: <data_dir>/<vm-name> on host → ~/data in VM.
+# Default: ~/glowbox
+# data_dir: ~/glowbox
